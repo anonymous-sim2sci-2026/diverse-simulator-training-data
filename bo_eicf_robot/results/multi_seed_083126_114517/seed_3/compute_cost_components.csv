@@ -1,0 +1,8 @@
+component,total_seconds,mean_seconds_per_iteration,fraction_of_measured_total,notes
+candidate_scoring,19.204893827438354,0.6401631275812785,0.001979398264476987,Acquisition scoring: EI-CF MC posterior sampling or direct scalar EI.
+robot_selection,26.929577589035034,0.8976525863011678,0.0027755612513034296,h-space trust-region/diversity filtering.
+nmma_simulation,9115.439872264862,303.8479957421621,0.9395045880090698,Expensive NMMA injection and light-curve simulation.
+postprocess_rollout_and_io,0.1473383903503418,0.004911279678344727,1.5185783205613275e-05,Reading simulation products and drawing active-search labels.
+gp_refit,185.55927205085754,6.185309068361918,0.019125109691068377,Refitting the closed-loop GP after each measured event.
+bo_overhead_total,231.84108185768127,7.728036061922709,0.023895254990054408,Candidate scoring + ROBOT + postprocess + GP refit.
+measured_closed_loop_total,9702.389949560165,323.4129983186722,1.0,Total measured loop wall time across iterations.

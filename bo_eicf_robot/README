@@ -1,0 +1,25 @@
+# EI-CF + ROBOT training-data generation
+
+The method fits Gaussian-process surrogates for intermediate measurable
+properties `h(x)`, evaluates the composite detection score `g(h)`, and selects
+new simulator inputs using EI-CF inside ROBOT h-space trust regions. The ROBOT
+diversity constraint uses scaled L1 distance, with the threshold `tau` set by the empirical CDF of pairwise distances among measurable training events.
+
+
+## Entry point
+
+Use `run_multi_seed.py` for experiments. The `run_bo.py` module is kept only
+because `run_multi_seed.py` imports its internal `run_single()` function.
+
+## Multi-seed run
+
+```bash
+python run_multi_seed.py \
+  --seeds 1-10 \
+  --n-iterations 30 \
+  --acquisition ROBOT_EICF \
+  --robot-distance-mode tail_l1 \
+  --robot-tau-quantile 75 \
+  --candidate-samples 1500 \
+  --eicf-mc-samples 16
+```

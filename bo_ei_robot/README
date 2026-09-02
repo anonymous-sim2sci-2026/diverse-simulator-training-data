@@ -1,0 +1,19 @@
+# EI + ROBOT comparison
+
+The method fits a scalar Gaussian-process surrogate for the final detection
+score `g(x)=P_detect` and applies the same ROBOT h-space trust-region and
+diversity filter used by EI-CF + ROBOT. The ROBOT diversity constraint uses scaled L1 distance, with the threshold `tau` set by the empirical CDF of pairwise distances among measurable training events.
+
+## Entry point
+
+Use `run_multi_seed.py` for experiments. The `run_bo.py` module is kept only
+because `run_multi_seed.py` imports its internal `run_single()` function.
+
+```bash
+python run_multi_seed.py \
+  --seeds 1-10 \
+  --n-iterations 30 \
+  --acquisition ROBOT_DIRECT_EI \
+  --robot-distance-mode tail_l1 \
+  --robot-tau-quantile 75
+```

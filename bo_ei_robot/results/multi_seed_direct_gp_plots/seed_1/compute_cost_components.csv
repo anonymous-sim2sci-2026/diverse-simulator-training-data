@@ -1,0 +1,6 @@
+component,total_seconds,mean_seconds_per_iteration,description
+X_simulation,9059.993769645691,301.99979232152305,Expensive NMMA injection/lightcurve-analysis simulation.
+Y_gp_refit,214.30801057815552,7.143600352605184,Direct scalar GP(g) refit after each new measured event.
+Z_candidate_scoring,2.2521612644195557,0.07507204214731852,Candidate acquisition scoring before the expensive simulation.
+Z_robot_selection,17.794559240341187,0.5931519746780396,ROBOT h-space trust/diversity filtering.
+Z_postprocess,0.10460209846496582,0.0034867366154988605,"Parsing light curves, extracting h(x), and assigning labels."
