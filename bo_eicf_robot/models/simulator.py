@@ -4,6 +4,7 @@ NMMA simulation runner
 
 import os
 import glob
+import signal
 import shutil
 import subprocess
 import sys
@@ -24,8 +25,84 @@ class SimulationRunner:
         self.filters = config.FILTERS
         self.svd_path = config.SVD_PATH
         self.prior_file = config.PRIOR_FILE
+        self.nmma_workdir = getattr(
+            config,
+            "NMMA_WORKDIR",
+            os.path.dirname(os.path.abspath(self.svd_path)),
+        )
         self.error_threshold = config.ERROR_THRESHOLD
         self.detection_calc = detection_calc
+        self.filter_timeout_seconds = int(
+            getattr(config, "NMMA_FILTER_TIMEOUT_SECONDS", 300)
+        )
+        self.injection_timeout_seconds = int(
+            getattr(config, "NMMA_INJECTION_TIMEOUT_SECONDS", 120)
+        )
+
+    @staticmethod
+    def _terminate_process_group(process, grace_seconds=10):
+        """Terminate a subprocess and all descendants, then reap the parent."""
+        if process.poll() is not None:
+            return process.communicate()
+
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            process.terminate()
+
+        try:
+            return process.communicate(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                process.kill()
+            stdout, stderr = process.communicate()
+            return stdout, stderr
+
+    def validate_environment(self):
+        """Fail before BO starts when the active Python cannot run NMMA."""
+        checks = (
+            ("nmma.em.analysis", "lightcurve-analysis"),
+            ("nmma.eos.create_injection", "nmma-create-injection"),
+        )
+        env = self._nmma_subprocess_env()
+        failures = []
+        for module, executable in checks:
+            process = subprocess.run(
+                [sys.executable, "-c", f"import {module}"],
+                cwd=self.nmma_workdir if os.path.isdir(self.nmma_workdir) else None,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if process.returncode != 0:
+                failures.append(
+                    f"{module}: {process.stderr.strip() or 'import failed'}"
+                )
+            resolved = self._nmma_executable(executable)
+            if not os.path.exists(resolved):
+                print(
+                    f"  Note: {executable} is not installed as a console script; "
+                    f"the code will use {sys.executable} -c 'import {module}'."
+                )
+
+        if failures:
+            details = "\n".join(f"  - {failure}" for failure in failures)
+            raise RuntimeError(
+                "The active Python environment cannot import the required NMMA modules.\n"
+                f"Python: {sys.executable}\n"
+                f"NMMA working directory: {self.nmma_workdir}\n"
+                f"{details}\n"
+                "Activate the intended conda environment and install the NMMA repository "
+                "with: python -m pip install -e /path/to/nmma/repository"
+            )
+
+        if not os.path.isdir(self.nmma_workdir):
+            raise RuntimeError(f"NMMA working directory not found: {self.nmma_workdir}")
+
+        print(f"  NMMA import check passed with: {sys.executable}")
+        print(f"  NMMA working directory: {self.nmma_workdir}")
 
     def calculate_chirp_mass(self, mass1, mass2):
         """Calculate chirp mass from component masses"""
@@ -72,6 +149,8 @@ class SimulationRunner:
 
     def _write_candidate_dat_file(self, gw_params, kilonova_params, output_dir):
         """Write the BO candidate as the .dat input for nmma-create-injection."""
+        output_dir = os.path.abspath(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         dat_file = os.path.join(output_dir, "candidate.dat")
 
         row = {
@@ -97,6 +176,7 @@ class SimulationRunner:
 
     def create_nmma_injection(self, gw_params, kilonova_params, output_dir):
         """Generate injection.json from candidate.dat with nmma-create-injection."""
+        output_dir = os.path.abspath(output_dir)
         dat_file = self._write_candidate_dat_file(gw_params, kilonova_params, output_dir)
         injection_file = os.path.join(output_dir, "injection.json")
 
@@ -117,13 +197,24 @@ class SimulationRunner:
 
         process = subprocess.Popen(
             cmd,
-            cwd=os.environ.get("NMMA_WORKDIR", os.getcwd()),
+            cwd=self.nmma_workdir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             env=self._nmma_subprocess_env(),
+            start_new_session=True,
         )
-        stdout, stderr = process.communicate(timeout=60)
+        try:
+            stdout, stderr = process.communicate(
+                timeout=self.injection_timeout_seconds
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = self._terminate_process_group(process)
+            raise RuntimeError(
+                "nmma-create-injection timed out after "
+                f"{self.injection_timeout_seconds}s. stderr tail:\n"
+                f"{stderr[-2000:] if stderr else '(empty)'}"
+            ) from exc
 
         if process.returncode != 0:
             raise RuntimeError(
@@ -169,9 +260,7 @@ class SimulationRunner:
         return [exe]
 
     def _copy_nmma_outputs(self, nmma_output_dir, output_dir):
-        """Copy NMMA products from the short work directory to the BO output dir."""
-        for src in glob.glob(os.path.join(nmma_output_dir, "*_lightcurves.png")):
-            shutil.copy2(src, os.path.join(output_dir, os.path.basename(src)))
+        """NMMA plots stay in the temporary directory and are not retained."""
 
     def _nmma_subprocess_env(self):
         """Use isolated, conservative settings for NMMA subprocesses."""
@@ -257,6 +346,7 @@ class SimulationRunner:
             peak_mag: float - Peak magnitude of the brightest filter
         """
         try:
+            output_dir = os.path.abspath(output_dir)
             os.makedirs(output_dir, exist_ok=True)
 
             if not os.path.exists(self.svd_path):
@@ -270,7 +360,6 @@ class SimulationRunner:
             injection_file = self.create_nmma_injection(gw_params, kilonova_params, output_dir)
 
             lc_frames = []
-            too_frames = []
             stdout_parts = []
             stderr_parts = []
             return_codes = []
@@ -302,22 +391,31 @@ class SimulationRunner:
 
                 process = subprocess.Popen(
                     cmd,
+                    cwd=self.nmma_workdir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
                     env=self._nmma_subprocess_env(),
+                    start_new_session=True,
                 )
 
                 try:
-                    stdout, stderr = process.communicate(timeout=100)
+                    stdout, stderr = process.communicate(
+                        timeout=self.filter_timeout_seconds
+                    )
                     return_code = process.returncode
                 except subprocess.TimeoutExpired:
-                    print(f"      [WARNING] Simulation for {filt} exceeded 100s timeout — terminating.")
-                    process.kill()
-                    try:
-                        stdout, stderr = process.communicate(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        stdout, stderr = "", "(process did not exit even after kill)"
+                    print(
+                        f"      [WARNING] Simulation for {filt} exceeded "
+                        f"{self.filter_timeout_seconds}s timeout; terminating "
+                        "the complete NMMA process group."
+                    )
+                    stdout, stderr = self._terminate_process_group(process)
+                    timeout_note = (
+                        f"NMMA filter process timed out after "
+                        f"{self.filter_timeout_seconds}s and was terminated."
+                    )
+                    stderr = f"{stderr or ''}\n{timeout_note}".strip()
                     return_code = -1
 
                 return_codes.append(return_code)
@@ -326,10 +424,6 @@ class SimulationRunner:
 
                 if os.path.exists(lc_outfile) and os.path.getsize(lc_outfile) > 0:
                     lc_frames.append(pd.read_csv(lc_outfile))
-
-                too_outfile = os.path.join(nmma_output_dir, "too.csv")
-                if os.path.exists(too_outfile) and os.path.getsize(too_outfile) > 0:
-                    too_frames.append(pd.read_csv(too_outfile))
 
                 self._copy_nmma_outputs(nmma_output_dir, output_dir)
                 shutil.rmtree(nmma_output_dir, ignore_errors=True)
@@ -344,23 +438,15 @@ class SimulationRunner:
                 pd.concat(lc_frames, ignore_index=True).to_csv(
                     os.path.join(output_dir, "lc.csv"), index=False
                 )
-                self.plot_lightcurve(output_dir)
-            if too_frames:
-                pd.concat(too_frames, ignore_index=True).to_csv(
-                    os.path.join(output_dir, "too.csv"), index=False
-                )
-
             # Check output files
             lc_file = os.path.join(output_dir, "lc.csv")
-            too_file = os.path.join(output_dir, "too.csv")
 
             lc_exists = os.path.exists(lc_file) and os.path.getsize(lc_file) > 0
-            too_exists = os.path.exists(too_file) and os.path.getsize(too_file) > 0
 
             peak_mag = 99.0
             detectable = False
 
-            if lc_exists or too_exists:
+            if lc_exists:
                 detectable, peak_mag = self.check_detections_and_extract_peak_mag(output_dir)
             else:
                 print(f"      [DEBUG] return_code={return_code}")
@@ -372,14 +458,19 @@ class SimulationRunner:
 
             if detectable:
                 return detectable, f"DETECTABLE (peak mag: {peak_mag:.2f})", peak_mag
-            elif lc_exists or too_exists:
+            elif lc_exists:
                 return detectable, f"NOT DETECTABLE (peak mag: {peak_mag:.2f})", peak_mag
             else:
-                return False, "No output files created", peak_mag
+                raise RuntimeError(
+                    "NMMA created no light-curve output. This is a simulation failure, "
+                    "not a non-detectable event. "
+                    f"return_code={return_code}. stderr tail:\n"
+                    f"{stderr[-2000:] if stderr else '(empty)'}"
+                )
 
         except Exception as e:
             print(f"Simulation error: {e}")
-            return False, f"Error: {e}", 99.0
+            raise RuntimeError(f"NMMA simulation failed: {e}") from e
 
     def check_detections_and_extract_peak_mag(self, output_dir):
         """
@@ -454,10 +545,7 @@ class SimulationRunner:
 
     def cleanup_simulation_files(self, output_dir):
         """Clean up temporary files"""
-        files_to_keep = ['lc.csv', 'too.csv', 'candidate.dat', 'injection.json', 'lightcurve.png']
-        # Keep plots if they exist
-        plot_files = glob.glob(os.path.join(output_dir, "*_lightcurves.png"))
-        files_to_keep.extend([os.path.basename(f) for f in plot_files])
+        files_to_keep = ['lc.csv', 'candidate.dat', 'injection.json']
 
         try:
             all_files = glob.glob(os.path.join(output_dir, '*'))

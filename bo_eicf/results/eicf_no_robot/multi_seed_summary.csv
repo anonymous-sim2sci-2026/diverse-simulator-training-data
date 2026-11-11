@@ -1,0 +1,4 @@
+seed,output_folder,plots_folder,bo_detections,random_detections,bo_success_rate,random_success_rate,best_peak_magnitude
+1,out/eicf_no_robot1/seed_1,/projects/bdws/npletskova1/git/nmma1/bo_cdf_eicf1/plots/seed_1,80,3,1.0,0.0375,14.528680447009378
+2,out/eicf_no_robot1/seed_2,/projects/bdws/npletskova1/git/nmma1/bo_cdf_eicf1/plots/seed_2,80,3,1.0,0.0375,15.074335022400083
+3,out/eicf_no_robot1/seed_3,/projects/bdws/npletskova1/git/nmma1/bo_cdf_eicf1/plots/seed_3,80,5,1.0,0.0625,14.33382031817558

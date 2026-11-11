@@ -8,11 +8,17 @@ ROBOT_DIRECT_EI adds predicted h-space trust/diversity filtering before simulati
 import os
 import sys
 import subprocess
+import argparse
 import time
 import numpy as np
 import pandas as pd
 from datetime import datetime
 import joblib
+
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    os.path.join(os.environ.get("TMPDIR", "/tmp"), "matplotlib-cache"),
+)
 
 from config import Config
 from data.loader import load_and_prepare_data, prepare_training_data
@@ -20,6 +26,9 @@ from models import build_gp_models, SimulationRunner
 from models.gp_surrogate import MULTITASK_GP_KEY, build_fast_h_diagnostic_models
 from models.multitask_gp import build_multitask_magnitude_gp
 from optimization import closed_loop_bayesian_optimization
+from optimization.batch_bayesian_optimization import (
+    closed_loop_batched_bayesian_optimization,
+)
 from utils.detection import DetectionCalculator
 from utils.h_columns import H_OUTPUT_COLUMNS
 from utils.visualization import (
@@ -31,6 +40,7 @@ from utils.visualization import (
     plot_active_search_benchmark,
 )
 
+
 def run_single(
     seed=None,
     n_iterations=30,
@@ -39,9 +49,32 @@ def run_single(
     make_plots=True,
     robot_distance_mode="tail_l1",
     robot_tau_quantile=85.0,
+    robot_initial_length=0.6,
+    robot_success_tolerance=10,
+    robot_failure_tolerance=32,
     robot_rarity_n_bins=20,
+    robot_n_regions=10,
+    robot_batch_regions=None,
+    robot_candidates_per_region=1,
+    parallel_simulations=1,
+    candidate_samples=1500,
+    candidate_uniform_samples=500,
+    robot_region_candidates=300,
+    trust_region_max_resamples=20,
+    scoring_progress_every=0,
+    direct_gp_restarts=5,
+    direct_gp_max_fit_points=None,
+    checkpoint_every=1,
+    resume=False,
+    checkpoint_file=None,
+    max_runtime_hours=None,
+    debug_candidate_details=False,
+    track_all_candidate_probs=False,
+    save_direct_gp=False,
+    refit_output_gps=False,
+    output_gp_refit_every=1,
 ):
-    """Internal helper used by run_multi_seed.py for one seed."""
+    """Run one closed-loop direct-GP rollout and return paths/results."""
     if acquisition != "ROBOT_DIRECT_EI":
         raise ValueError(
             "This paper-facing folder only supports --acquisition ROBOT_DIRECT_EI."
@@ -49,6 +82,21 @@ def run_single(
     if robot_distance_mode != "tail_l1":
         raise ValueError(
             "This paper-facing folder only supports --robot-distance-mode tail_l1."
+        )
+    if not 0.05 <= float(robot_initial_length) <= 1.0:
+        raise ValueError("--robot-initial-length must be between 0.05 and 1.0")
+    if int(robot_n_regions) < 1:
+        raise ValueError("--robot-n-regions must be at least 1")
+    if robot_batch_regions is None:
+        robot_batch_regions = int(robot_n_regions)
+    if not 1 <= int(robot_batch_regions) <= int(robot_n_regions):
+        raise ValueError("--robot-batch-regions must be between 1 and --robot-n-regions")
+    if int(robot_candidates_per_region) < 1:
+        raise ValueError("--robot-candidates-per-region must be at least 1")
+    max_batch_events = int(robot_batch_regions) * int(robot_candidates_per_region)
+    if not 1 <= int(parallel_simulations) <= max_batch_events:
+        raise ValueError(
+            "--parallel-simulations must be between 1 and the maximum batch size"
         )
 
     if seed is not None:
@@ -66,8 +114,8 @@ def run_single(
     project_dir = os.path.dirname(os.path.abspath(__file__))
     if output_folder is None:
         output_folder = config.output_dir
-    else:
-        os.makedirs(output_folder, exist_ok=True)
+    output_folder = os.path.abspath(output_folder)
+    os.makedirs(output_folder, exist_ok=True)
     print(f"\nOutput folder: {output_folder}")
 
     # Plots go in a separate directory. For multi-seed runs, include the
@@ -183,12 +231,18 @@ def run_single(
     print("=" * 80)
 
     sim_output_dir = output_folder
+    batched_robot = int(robot_batch_regions) > 1 or int(robot_candidates_per_region) > 1
 
     closed_loop_t0 = time.time()
+    optimization_function = (
+        closed_loop_batched_bayesian_optimization
+        if batched_robot
+        else closed_loop_bayesian_optimization
+    )
     (
         best_X, best_peak_mag, true_eval_log, gp_models, scaler_X, detection_gp,
         direct_gp, direct_scaler_X, results, new_events_df
-    ) = closed_loop_bayesian_optimization(
+    ) = optimization_function(
         X_train=X_train,
         y_train_mags=y_train_mags,
         y_train_detection=y_train_detection,
@@ -208,6 +262,34 @@ def run_single(
         robot_distance_mode=robot_distance_mode,
         robot_tau_quantile=robot_tau_quantile,
         robot_rarity_n_bins=robot_rarity_n_bins,
+        **(
+            {
+                "robot_n_regions": robot_n_regions,
+                "robot_initial_length": robot_initial_length,
+                "robot_success_tolerance": robot_success_tolerance,
+                "robot_failure_tolerance": robot_failure_tolerance,
+                "robot_batch_regions": robot_batch_regions,
+                "robot_candidates_per_region": robot_candidates_per_region,
+                "parallel_simulations": parallel_simulations,
+                "robot_region_candidates": robot_region_candidates,
+                "trust_region_max_resamples": trust_region_max_resamples,
+                "scoring_progress_every": scoring_progress_every,
+                "resume": resume,
+                "checkpoint_file": checkpoint_file,
+                "max_runtime_hours": max_runtime_hours,
+                "refit_output_gps": refit_output_gps,
+                "output_gp_refit_every": output_gp_refit_every,
+            }
+            if batched_robot
+            else {}
+        ),
+        candidate_samples=candidate_samples,
+        candidate_uniform_samples=candidate_uniform_samples,
+        direct_gp_restarts=direct_gp_restarts,
+        direct_gp_max_fit_points=direct_gp_max_fit_points,
+        checkpoint_every=checkpoint_every,
+        debug_candidate_details=debug_candidate_details,
+        track_all_candidate_probs=track_all_candidate_probs,
     )
     closed_loop_seconds = time.time() - closed_loop_t0
 
@@ -217,12 +299,13 @@ def run_single(
     print("\n[6] SAVE RESULTS")
     print("-" * 40)
 
-    direct_model_path = os.path.join(output_folder, "direct_gp_final.joblib")
-    joblib.dump(
-        {"direct_gp": direct_gp, "direct_scaler_X": direct_scaler_X},
-        direct_model_path,
-    )
-    print(f"  Saved final direct scalar GP model: direct_gp_final.joblib")
+    if save_direct_gp:
+        direct_model_path = os.path.join(output_folder, "direct_gp_final.joblib")
+        joblib.dump(
+            {"direct_gp": direct_gp, "direct_scaler_X": direct_scaler_X},
+            direct_model_path,
+        )
+        print(f"  Saved final direct scalar GP model: direct_gp_final.joblib")
 
     if true_eval_log:
         true_eval_df = pd.DataFrame(true_eval_log)
@@ -262,6 +345,18 @@ def run_single(
         'acquisition': acquisition,
         'robot_distance_mode': robot_distance_mode,
         'robot_tau_quantile': robot_tau_quantile,
+        'robot_success_tolerance': robot_success_tolerance,
+        'robot_failure_tolerance': robot_failure_tolerance,
+        'candidate_samples': candidate_samples,
+        'candidate_uniform_samples': candidate_uniform_samples,
+        'direct_gp_restarts': direct_gp_restarts,
+        'direct_gp_max_fit_points': direct_gp_max_fit_points,
+        'checkpoint_every': checkpoint_every,
+        'debug_candidate_details': debug_candidate_details,
+        'track_all_candidate_probs': track_all_candidate_probs,
+        'save_direct_gp': save_direct_gp,
+        'refit_output_gps': refit_output_gps,
+        'output_gp_refit_every': output_gp_refit_every,
         'initial_gp_seconds': initial_gp_seconds,
         'initial_gp_source': initial_gp_source,
         'closed_loop_seconds': closed_loop_seconds,
@@ -363,7 +458,8 @@ def run_single(
     print("  - closed_loop_results.csv (each iteration's simulation)")
     print("  - new_events_with_h.csv (new samples with predicted/true h columns)")
     print("  - summary.csv (run summary)")
-    print("  - direct_gp_final.joblib (final scalar GP on g(x)=P_detect)")
+    if save_direct_gp:
+        print("  - direct_gp_final.joblib (final scalar GP on g(x)=P_detect)")
     print(f"\nAll plots saved to: {plots_folder}/")
     print("  - true_simulation_history.png")
     print("  - parameter_exploration.png")
@@ -388,3 +484,185 @@ def run_single(
         "results": results,
         "new_events_df": new_events_df,
     }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run one bo_cdf_direct_gp_robot1 closed-loop rollout.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible rollout labels/candidates.")
+    parser.add_argument("--n-iterations", type=int, default=30, help="Number of closed-loop NMMA evaluations.")
+    parser.add_argument(
+        "--acquisition",
+        choices=["ROBOT_DIRECT_EI"],
+        default="ROBOT_DIRECT_EI",
+        help="Paper comparison method: scalar-GP direct EI plus h-space ROBOT filtering.",
+    )
+    parser.add_argument("--output-folder", default=None, help="Optional explicit output folder for this run.")
+    parser.add_argument("--no-plots", action="store_true", help="Skip plot generation.")
+    parser.add_argument(
+        "--robot-distance-mode",
+        choices=["tail_l1"],
+        default="tail_l1",
+        help=(
+            "ROBOT h-space diversity distance used in the paper: unweighted scaled L1 with "
+            "tau from the empirical pairwise-distance CDF."
+        ),
+    )
+    parser.add_argument(
+        "--robot-tau-quantile",
+        type=float,
+        default=85.0,
+        help="Percentile of useful-event pairwise h-space distances used as tau. 85 keeps the largest 15%% tail.",
+    )
+    parser.add_argument(
+        "--robot-initial-length", type=float, default=0.6,
+        help="Initial side length of each ranked h-space trust region.",
+    )
+    parser.add_argument(
+        "--robot-success-tolerance", type=int, default=10,
+        help="Consecutive successful region updates required before expansion.",
+    )
+    parser.add_argument(
+        "--robot-failure-tolerance", type=int, default=32,
+        help="Consecutive failed region updates required before contraction.",
+    )
+    parser.add_argument(
+        "--robot-n-regions", type=int, default=10,
+        help="Number of ranked ROBOT trust regions to maintain.",
+    )
+    parser.add_argument(
+        "--robot-batch-regions", type=int, default=None,
+        help=(
+            "Number of ranked regions evaluated in each BO step (default: all M). "
+            "Set this equal to --robot-n-regions for the simultaneous ROBOT schedule."
+        ),
+    )
+    parser.add_argument(
+        "--robot-candidates-per-region", type=int, default=1,
+        help=(
+            "Maximum candidates selected from each active region per batch "
+            "(default: one). Diversity is enforced hierarchically between regions."
+        ),
+    )
+    parser.add_argument(
+        "--parallel-simulations", type=int, default=1,
+        help="Maximum NMMA simulations run concurrently.",
+    )
+    parser.add_argument(
+        "--robot-region-candidates", type=int, default=300,
+        help="Targeted candidates sampled around each ranked region center.",
+    )
+    parser.add_argument(
+        "--trust-region-max-resamples", type=int, default=20,
+        help="Maximum candidate-pool redraws when no region is feasible.",
+    )
+    parser.add_argument(
+        "--scoring-progress-every", type=int, default=0,
+        help="Candidate-scoring progress interval; 0 disables it.",
+    )
+    parser.add_argument(
+        "--candidate-samples",
+        type=int,
+        default=1500,
+        help="Number of near-detectable candidate points to score per iteration.",
+    )
+    parser.add_argument(
+        "--candidate-uniform-samples",
+        type=int,
+        default=500,
+        help="Number of additional uniform candidate points per iteration.",
+    )
+    parser.add_argument(
+        "--direct-gp-restarts",
+        type=int,
+        default=5,
+        help="n_restarts_optimizer for the scalar direct GP. Use 0 for faster exploratory long runs.",
+    )
+    parser.add_argument(
+        "--direct-gp-max-fit-points",
+        type=int,
+        default=None,
+        help="Optional cap on scalar-GP training points for approximate long runs. Unset keeps the exact full GP.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        help="Write closed_loop_results.csv and new_events_with_h.csv every N iterations. Use 0 to checkpoint only at the end.",
+    )
+    parser.add_argument("--resume", action="store_true", help="Resume a batched run checkpoint.")
+    parser.add_argument("--checkpoint-file", default=None, help="Optional batched checkpoint path.")
+    parser.add_argument(
+        "--max-runtime-hours", type=float, default=None,
+        help="Stop cleanly near this runtime and save a checkpoint.",
+    )
+    # Accepted for command compatibility with EI-CF runs; direct EI does not use MC.
+    parser.add_argument("--eicf-mc-samples", type=int, default=16, help=argparse.SUPPRESS)
+    parser.add_argument("--eicf-batch-size", type=int, default=512, help=argparse.SUPPRESS)
+    parser.add_argument("--skip-detection-gp-refit", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--refit-output-gps",
+        action="store_true",
+        help=(
+            "Refit the h-output GP models after each completed BO batch. "
+            "The scalar direct-EI GP is always refitted."
+        ),
+    )
+    parser.add_argument(
+        "--output-gp-refit-every",
+        type=int,
+        default=1,
+        help="Refit h-output GPs every N completed batches (default: 1).",
+    )
+    parser.add_argument(
+        "--debug-candidate-details",
+        action="store_true",
+        help="Print expensive top-candidate diagnostics each iteration.",
+    )
+    parser.add_argument(
+        "--track-all-candidate-probs",
+        action="store_true",
+        help="Store direct-GP probabilities for every scored candidate for diagnostic plots.",
+    )
+    parser.add_argument(
+        "--save-direct-gp",
+        action="store_true",
+        help="Save the final scalar GP joblib model. Off by default for long runs.",
+    )
+    args = parser.parse_args()
+
+    run_single(
+        seed=args.seed,
+        n_iterations=args.n_iterations,
+        acquisition=args.acquisition,
+        output_folder=args.output_folder,
+        make_plots=not args.no_plots,
+        robot_distance_mode=args.robot_distance_mode,
+        robot_tau_quantile=args.robot_tau_quantile,
+        robot_initial_length=args.robot_initial_length,
+        robot_success_tolerance=args.robot_success_tolerance,
+        robot_failure_tolerance=args.robot_failure_tolerance,
+        robot_n_regions=args.robot_n_regions,
+        robot_batch_regions=args.robot_batch_regions,
+        robot_candidates_per_region=args.robot_candidates_per_region,
+        parallel_simulations=args.parallel_simulations,
+        candidate_samples=args.candidate_samples,
+        candidate_uniform_samples=args.candidate_uniform_samples,
+        robot_region_candidates=args.robot_region_candidates,
+        trust_region_max_resamples=args.trust_region_max_resamples,
+        scoring_progress_every=args.scoring_progress_every,
+        direct_gp_restarts=args.direct_gp_restarts,
+        direct_gp_max_fit_points=args.direct_gp_max_fit_points,
+        checkpoint_every=args.checkpoint_every,
+        resume=args.resume,
+        checkpoint_file=args.checkpoint_file,
+        max_runtime_hours=args.max_runtime_hours,
+        debug_candidate_details=args.debug_candidate_details,
+        track_all_candidate_probs=args.track_all_candidate_probs,
+        save_direct_gp=args.save_direct_gp,
+        refit_output_gps=args.refit_output_gps,
+        output_gp_refit_every=args.output_gp_refit_every,
+    )
+
+
+if __name__ == "__main__":
+    main()

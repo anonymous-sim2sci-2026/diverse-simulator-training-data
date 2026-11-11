@@ -470,7 +470,7 @@ def _simulate_random_baseline(
     probs = np.array([
         objective_function_probability(
             x, gp_models, scaler_X, flat_limits,
-            detection_calc=detection_calc
+            detection_gp=None, use_gp_detection=False, detection_calc=detection_calc
         )
         for x in X_random
     ])

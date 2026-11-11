@@ -1,0 +1,55 @@
+# EI-CF without ROBOT
+
+This directory contains the EI-CF active-search baseline used to isolate the
+effect of ROBOT. It uses the same Gaussian-process output models and composite
+detectability function as EI-CF+ROBOT, but applies no trust-region or diversity
+filter.
+
+For each candidate input, EI-CF draws posterior samples of the predicted
+outputs and evaluates the composite detection score. With `--active-search`,
+the acquisition is the mean predicted detectability rather than improvement
+over the current best value. The highest-scoring candidate is sent to NMMA,
+and one new event is produced per iteration.
+
+## Environment
+
+```bash
+export NMMA_WORKDIR=/path/to/nmma/source/checkout
+export SVD_PATH=/path/to/svdmodels
+export PRIOR_FILE=/path/to/priors/Bu2019lm.prior
+export OUTPUT_BASE="$PWD/out"
+```
+
+## Paper configuration
+
+Single seed:
+
+```bash
+python -u run_bo.py \
+  --seed 1 \
+  --n-iterations 80 \
+  --output-folder out/eicf_no_robot/seed_1 \
+  --acquisition EI \
+  --active-search \
+  --candidate-samples 1500 \
+  --eicf-mc-samples 16 \
+  --no-plots
+```
+
+Three seeds:
+
+```bash
+python -u run_multi_seed.py \
+  --seeds 1-3 \
+  --n-iterations 80 \
+  --output-root out/eicf_no_robot \
+  --candidate-samples 1500 \
+  --eicf-mc-samples 16 \
+  --no-plots
+```
+
+The run records `algorithm_overhead_seconds` for each event, allowing overhead
+to be averaged over the same first-80-event budget used for the paper table.
+The bundled metric scripts calculate measurable fraction and the summed
+eight-dimensional marginal KL using fixed bins derived from the initial
+measurable training events.

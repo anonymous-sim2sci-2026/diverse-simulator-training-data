@@ -1,19 +1,73 @@
-# EI + ROBOT comparison
+# EI + ROBOT
 
-The method fits a scalar Gaussian-process surrogate for the final detection
-score `g(x)=P_detect` and applies the same ROBOT h-space trust-region and
-diversity filter used by EI-CF + ROBOT. The ROBOT diversity constraint uses scaled L1 distance, with the threshold `tau` set by the empirical CDF of pairwise distances among measurable training events.
+This directory contains the paper implementation of direct expected
+improvement (EI) with ranked ROBOT trust regions in normalized simulator-output
+space.
 
-## Entry point
+At each BO batch the code fits the scalar detectability GP, optionally refits
+the output GPs used by ROBOT, scores a shared candidate pool, processes the
+ranked regions in order, and evaluates the selected simulations concurrently.
+The included CSV files provide the initial O5a/O5b/O5c training data. NMMA SVD
+models and the prior file are not stored in this repository.
 
-Use `run_multi_seed.py` for experiments. The `run_bo.py` module is kept only
-because `run_multi_seed.py` imports its internal `run_single()` function.
+## Environment
+
+Install the Python requirements and NMMA, then set the external paths:
 
 ```bash
-python run_multi_seed.py \
-  --seeds 1-10 \
-  --n-iterations 30 \
+export NMMA_WORKDIR=/path/to/nmma/source/checkout
+export SVD_PATH=/path/to/svdmodels
+export PRIOR_FILE=/path/to/priors/Bu2019lm.prior
+export OUTPUT_BASE="$PWD/out"
+```
+
+`NMMA_SVD_PATH`, `NMMA_PRIOR_FILE`, and `BO_OUTPUT_BASE` are accepted as
+backward-compatible aliases.
+
+## Paper configuration
+
+```bash
+python -u run_bo.py \
+  --seed 1 \
+  --n-iterations 80 \
+  --output-folder out/direct_ei_all_regions_seed1 \
   --acquisition ROBOT_DIRECT_EI \
   --robot-distance-mode tail_l1 \
-  --robot-tau-quantile 75
+  --robot-tau-quantile 75 \
+  --robot-initial-length 0.6 \
+  --robot-success-tolerance 10 \
+  --robot-failure-tolerance 32 \
+  --robot-n-regions 5 \
+  --robot-batch-regions 5 \
+  --robot-candidates-per-region 1 \
+  --parallel-simulations 5 \
+  --candidate-samples 1500 \
+  --direct-gp-restarts 5 \
+  --refit-output-gps \
+  --output-gp-refit-every 1 \
+  --no-plots \
+  --checkpoint-every 1 \
+  --scoring-progress-every 0
 ```
+
+This uses five ranked regions, selects at most one candidate per region, runs
+up to five simulations concurrently, and refits the output GPs after every
+completed batch. `--n-iterations` counts BO batches, not selected simulations;
+each batch produces zero to five events depending on feasibility.
+
+The base pool contains 1,500 uniform inputs because the uniform count equals
+the total candidate count.
+
+## Multiple seeds
+
+```bash
+python -u run_multi_seed.py \
+  --seeds 1-3 \
+  --n-iterations 80 \
+  --output-root out/paper_ei_robot \
+  --no-plots
+```
+
+Each run writes its event table, checkpoint, and NMMA products beneath its
+output directory. Resume an interrupted run with identical settings and
+`--resume`.

@@ -470,7 +470,7 @@ def _simulate_random_baseline(
     probs = np.array([
         objective_function_probability(
             x, gp_models, scaler_X, flat_limits,
-            detection_calc=detection_calc
+            detection_gp=None, use_gp_detection=False, detection_calc=detection_calc
         )
         for x in X_random
     ])
@@ -514,7 +514,7 @@ def _first_iteration_at_or_below(series, threshold):
 
 def _write_computational_benefit_summary(metrics, bo_log, output_folder):
     """
-    Save cost accounting.
+    Save Ari-style cost accounting.
 
     X = expensive NMMA simulation time.
     Y = GP fitting/refit time.

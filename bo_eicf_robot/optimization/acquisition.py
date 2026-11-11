@@ -175,6 +175,7 @@ def expected_improvement_composite_batch(
     batch_size: int = 128,
     random_state: int = 12345,
     progress_every: int = 1,
+    active_search: bool = False,
 ) -> np.ndarray:
     """
     Batch EI-CF for many candidates.
@@ -228,11 +229,15 @@ def expected_improvement_composite_batch(
                 sampled_probs = composite_detection_probability(
                     h_samples, filters, flat_limits, detection_calc
                 )
-                improvements = np.maximum(sampled_probs - best_score - xi, 0.0)
-                scores[start + local_i] = float(np.mean(improvements))
+                if active_search:
+                    scores[start + local_i] = float(np.mean(sampled_probs))
+                else:
+                    improvements = np.maximum(sampled_probs - best_score - xi, 0.0)
+                    scores[start + local_i] = float(np.mean(improvements))
 
             if progress_every and (chunk_idx == 1 or chunk_idx % progress_every == 0 or stop == len(X)):
-                print(f"        EI-CF batch scored {stop}/{len(X)} candidates", flush=True)
+                label = "active-search composite" if active_search else "EI-CF"
+                print(f"        {label} batch scored {stop}/{len(X)} candidates", flush=True)
 
         return scores
 
@@ -258,14 +263,25 @@ def expected_improvement_composite_batch(
         stop = min(start + batch_size, len(X))
         z = rng.standard_normal(size=(stop - start, n_mc, len(used_filters)))
         h_samples = means[start:stop, None, :] + z * stds[start:stop, None, :]
-        for local_i in range(stop - start):
-            sampled_probs = composite_detection_probability(
-                h_samples[local_i], used_filters, flat_limits, detection_calc
-            )
-            improvements = np.maximum(sampled_probs - best_score - xi, 0.0)
-            scores[start + local_i] = float(np.mean(improvements))
+
+        prob_cols = []
+        for j, filt in enumerate(used_filters):
+            limit = flat_limits.get(filt)
+            if limit is None:
+                continue
+            sigma = detection_calc.filter_errors.get(filt, 0.1)
+            prob_cols.append(norm.cdf((limit - h_samples[:, :, j]) / sigma))
+        if prob_cols:
+            sampled_probs = np.max(np.stack(prob_cols, axis=2), axis=2)
+            if active_search:
+                scores[start:stop] = np.mean(sampled_probs, axis=1)
+            else:
+                improvements = np.maximum(sampled_probs - best_score - xi, 0.0)
+                scores[start:stop] = np.mean(improvements, axis=1)
+
         if progress_every:
-            print(f"        EI-CF batch scored {stop}/{len(X)} candidates", flush=True)
+            label = "active-search composite" if active_search else "EI-CF"
+            print(f"        {label} batch scored {stop}/{len(X)} candidates", flush=True)
 
     return scores
 
@@ -412,8 +428,12 @@ def sample_near_detectable(
     progress = iteration / max_iterations if max_iterations > 0 else 0
     adaptive_spread = spread_factor * (0.5 + 0.5 * (1 - progress))  # Starts at 1.0x, goes to 0.5x
     
-    # Adjust uniform samples: more early, fewer late
-    adaptive_uniform = int(n_uniform * (1 + (1 - progress)))  # More uniform early
+    # Use more global exploration early, then taper to the requested uniform
+    # subset. n_samples is the total candidate-pool size, not the number of
+    # nearby candidates.
+    adaptive_uniform = int(n_uniform * (1 + (1 - progress)))
+    n_uniform_actual = min(max(adaptive_uniform, 0), n_samples)
+    n_near = n_samples - n_uniform_actual
     
     detectable_mask = y_pool == 1
     X_detectable = X_pool[detectable_mask]
@@ -427,21 +447,36 @@ def sample_near_detectable(
     stds = np.std(X_detectable, axis=0)
     stds = np.maximum(stds, adaptive_spread * ranges * 0.1)
     
-    # Pick base points - biased toward BEST detectable points
-    # Give higher weight to better detections (closer = brighter)
-    if len(X_detectable) > 1:
-        # Weight by inverse magnitude (brighter = higher weight)
-        # Use distance as proxy for brightness (closer = brighter)
-        weights = 1.0 / (np.abs(X_detectable[:, -1]) + 1)  # Distance column (last)
-        weights = weights / weights.sum()
-        idx = np.random.choice(len(X_detectable), size=n_samples, p=weights)
+    # Pick nearby base points evenly across occupied distance bins. This avoids
+    # letting the much larger nearby population dominate candidate generation.
+    if n_near > 0:
+        if len(X_detectable) > 1:
+            n_distance_bins = min(10, len(X_detectable))
+            distance_edges = np.linspace(lows[-1], highs[-1], n_distance_bins + 1)
+            distance_bins = np.clip(
+                np.digitize(X_detectable[:, -1], distance_edges[1:-1], right=False),
+                0,
+                n_distance_bins - 1,
+            )
+            occupied_bins = np.unique(distance_bins)
+            sampled_bins = np.random.choice(occupied_bins, size=n_near, replace=True)
+            idx = np.empty(n_near, dtype=int)
+            for distance_bin in occupied_bins:
+                target = np.flatnonzero(sampled_bins == distance_bin)
+                members = np.flatnonzero(distance_bins == distance_bin)
+                if len(target):
+                    idx[target] = np.random.choice(members, size=len(target), replace=True)
+        else:
+            idx = np.random.randint(0, len(X_detectable), size=n_near)
+
+        base_points = X_detectable[idx]
+        jitter = np.random.normal(
+            scale=stds * adaptive_spread,
+            size=(n_near, len(bounds)),
+        )
+        X_near = base_points + jitter
     else:
-        idx = np.random.randint(0, len(X_detectable), size=n_samples)
-    
-    base_points = X_detectable[idx]
-    jitter = np.random.normal(scale=stds * adaptive_spread, size=(n_samples, len(bounds)))
-    
-    X_near = base_points + jitter
+        X_near = np.empty((0, len(bounds)), dtype=float)
     
     # Reflect out-of-bounds values instead of clipping, to avoid pileup at the edges
     for dim in range(X_near.shape[1]):
@@ -455,36 +490,48 @@ def sample_near_detectable(
         col = np.clip(col, lo, hi)
         X_near[:, dim] = col
     
-    # Mix in uniform samples for exploration
-    n_uniform_actual = min(adaptive_uniform, n_samples)
+    # Mix in uniform samples for global exploration.
     X_uniform = lows + np.random.uniform(size=(n_uniform_actual, len(bounds))) * ranges
-    
-    # If we have too many uniform, trim; if too few, add more near samples
-    if n_uniform_actual < n_uniform:
-        extra_near = n_uniform - n_uniform_actual
-        extra_idx = np.random.randint(0, len(X_detectable), size=extra_near)
-        extra_base = X_detectable[extra_idx]
-        extra_jitter = np.random.normal(scale=stds * adaptive_spread, size=(extra_near, len(bounds)))
-        X_extra = extra_base + extra_jitter
-        # Reflect
-        for dim in range(X_extra.shape[1]):
-            lo, hi = lows[dim], highs[dim]
-            col = X_extra[:, dim]
-            below = col < lo
-            col[below] = lo + (lo - col[below])
-            above = col > hi
-            col[above] = hi - (col[above] - hi)
-            col = np.clip(col, lo, hi)
-            X_extra[:, dim] = col
-        X_candidates = np.vstack([X_near, X_uniform, X_extra])
-    else:
-        X_candidates = np.vstack([X_near, X_uniform[:n_uniform_actual]])
-    
-    # Ensure we have exactly n_samples (or close)
-    if len(X_candidates) > n_samples:
-        X_candidates = X_candidates[:n_samples]
-    
-    print(f"  Sampling: {len(X_near)} near detections, {n_uniform_actual} uniform, "
-          f"spread_factor={adaptive_spread:.3f}")
+
+    X_candidates = np.vstack([X_near, X_uniform])
+    if len(X_candidates) != n_samples:
+        raise RuntimeError(
+            f"Candidate sampler created {len(X_candidates)} points; expected {n_samples}."
+        )
+
+    # Shuffle so candidate ordering cannot favor either sampling component.
+    np.random.shuffle(X_candidates)
+
+    print(
+        f"  Sampling: {n_near} near detections + {n_uniform_actual} uniform "
+        f"= {len(X_candidates)} total, spread_factor={adaptive_spread:.3f}, "
+        "near_sampling=balanced_distance_bins"
+    )
     
     return X_candidates
+
+
+def sample_around_robot_center(
+    center: np.ndarray,
+    bounds: list,
+    n_samples: int,
+    spread_factor: float = 0.12,
+) -> np.ndarray:
+    """Sample inputs around the evaluated x associated with an h-space center."""
+    center = np.asarray(center, dtype=float)
+    lows = np.asarray([bound[0] for bound in bounds], dtype=float)
+    highs = np.asarray([bound[1] for bound in bounds], dtype=float)
+    ranges = highs - lows
+    samples = center + np.random.normal(
+        scale=np.maximum(spread_factor * ranges, 1e-12),
+        size=(int(n_samples), len(bounds)),
+    )
+    for dim, (low, high) in enumerate(zip(lows, highs)):
+        width = high - low
+        if width <= 0:
+            samples[:, dim] = low
+            continue
+        samples[:, dim] = low + np.mod(samples[:, dim] - low, 2.0 * width)
+        over = samples[:, dim] > high
+        samples[over, dim] = high - (samples[over, dim] - high)
+    return np.clip(samples, lows, highs)

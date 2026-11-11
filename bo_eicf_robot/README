@@ -1,25 +1,73 @@
-# EI-CF + ROBOT training-data generation
+# EI-CF + ROBOT
 
-The method fits Gaussian-process surrogates for intermediate measurable
-properties `h(x)`, evaluates the composite detection score `g(h)`, and selects
-new simulator inputs using EI-CF inside ROBOT h-space trust regions. The ROBOT
-diversity constraint uses scaled L1 distance, with the threshold `tau` set by the empirical CDF of pairwise distances among measurable training events.
+This directory contains the paper implementation of EI-CF active search with
+ranked ROBOT trust regions in normalized simulator-output space.
 
+The Gaussian-process models map the six simulator inputs to intermediate
+outputs. EI-CF estimates expected detectability using Monte Carlo posterior
+samples, while ROBOT processes the output-space regions in rank order and
+excludes candidates that violate diversity relative to higher-ranked regions.
+Selected NMMA simulations can be evaluated concurrently.
 
-## Entry point
+The included CSV files provide the initial O5a/O5b/O5c training data. NMMA SVD
+models and the prior file are not stored in this repository.
 
-Use `run_multi_seed.py` for experiments. The `run_bo.py` module is kept only
-because `run_multi_seed.py` imports its internal `run_single()` function.
-
-## Multi-seed run
+## Environment
 
 ```bash
-python run_multi_seed.py \
-  --seeds 1-10 \
-  --n-iterations 30 \
+export NMMA_WORKDIR=/path/to/nmma/source/checkout
+export SVD_PATH=/path/to/svdmodels
+export PRIOR_FILE=/path/to/priors/Bu2019lm.prior
+export OUTPUT_BASE="$PWD/out"
+```
+
+`NMMA_SVD_PATH`, `NMMA_PRIOR_FILE`, and `BO_OUTPUT_BASE` are accepted as
+backward-compatible aliases.
+
+## Paper configuration
+
+```bash
+python -u run_bo.py \
+  --seed 1 \
+  --n-iterations 80 \
+  --output-folder out/eicf_all_regions_seed1 \
   --acquisition ROBOT_EICF \
   --robot-distance-mode tail_l1 \
   --robot-tau-quantile 75 \
+  --robot-initial-length 0.6 \
+  --robot-success-tolerance 10 \
+  --robot-failure-tolerance 32 \
+  --robot-n-regions 5 \
+  --robot-batch-regions 5 \
+  --robot-candidates-per-region 1 \
+  --parallel-simulations 5 \
   --candidate-samples 1500 \
-  --eicf-mc-samples 16
+  --eicf-mc-samples 16 \
+  --eicf-batch-size 512 \
+  --refit-output-gps \
+  --output-gp-refit-every 1 \
+  --skip-detection-gp-refit \
+  --no-plots \
+  --checkpoint-every 1 \
+  --scoring-progress-every 0
 ```
+
+This uses five ranked regions, selects at most one event per region, runs up to
+five simulations concurrently, and refits the output GPs after every completed
+batch. `--n-iterations` counts BO batches; each batch produces zero to five
+events depending on feasibility.
+
+The base pool contains 1,500 uniform inputs because the uniform count equals
+the total candidate count. 
+
+## Multiple seeds
+
+```bash
+python -u run_multi_seed.py \
+  --seeds 1-3 \
+  --n-iterations 80 \
+  --output-root out/paper_eicf_robot \
+  --no-plots
+```
+
+Resume an interrupted run with identical settings and `--resume`.

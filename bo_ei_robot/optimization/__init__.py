@@ -1,7 +1,9 @@
 from .bayesian_optimization import closed_loop_bayesian_optimization
 from .objectives import (
+    objective_function_binary,
     objective_function_probability, 
     objective_function_margin,
+    objective_function_margin_batch,
 )
 from .acquisition import (
     direct_expected_improvement,

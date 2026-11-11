@@ -29,7 +29,7 @@ from optimization.acquisition import (
     sample_near_detectable,
     objective_with_uncertainty,
 )
-from optimization.objectives import objective_function_margin
+from optimization.objectives import objective_function_probability, objective_function_margin
 from optimization.robot_h import (
     ROBOT_ACQUISITIONS,
     build_robot_state,
@@ -134,6 +134,13 @@ def closed_loop_bayesian_optimization(
     robot_distance_mode: str = "tail_l1",
     robot_tau_quantile: float = 85.0,
     robot_rarity_n_bins: int = 20,
+    candidate_samples: int = 1500,
+    candidate_uniform_samples: int = 500,
+    direct_gp_restarts: int = 5,
+    direct_gp_max_fit_points: Optional[int] = None,
+    checkpoint_every: int = 1,
+    debug_candidate_details: bool = False,
+    track_all_candidate_probs: bool = False,
 ) -> Tuple:
     """
     CLOSED-LOOP DIRECT-GP BAYESIAN OPTIMIZATION
@@ -200,7 +207,12 @@ def closed_loop_bayesian_optimization(
 
     if direct_gp is None or direct_scaler_X is None:
         print("  Building direct scalar GP on g(x)=P_detect...")
-        direct_gp, direct_scaler_X = build_direct_gp_model(X_true_pool, g_true_pool)
+        direct_gp, direct_scaler_X = build_direct_gp_model(
+            X_true_pool,
+            g_true_pool,
+            n_restarts_optimizer=direct_gp_restarts,
+            max_fit_points=direct_gp_max_fit_points,
+        )
 
     robot_state = None
     if acquisition in ROBOT_ACQUISITIONS and diagnostic_gp_available:
@@ -253,6 +265,19 @@ def closed_loop_bayesian_optimization(
         results['margin_all'].append(margin)
         results['source'].append('training')
 
+    def _write_checkpoint():
+        if checkpoint_every is None or checkpoint_every <= 0 or not true_eval_log:
+            return
+        pd.DataFrame(true_eval_log).to_csv(
+            os.path.join(base_sim_output_dir, "closed_loop_results.csv"),
+            index=False,
+        )
+        if new_events_records:
+            pd.DataFrame(new_events_records).to_csv(
+                os.path.join(base_sim_output_dir, "new_events_with_h.csv"),
+                index=False,
+            )
+
     # MAIN LOOP: Iterate n_iterations times
     for iteration in range(n_iterations):
         iteration_t0 = time.time()
@@ -276,9 +301,9 @@ def closed_loop_bayesian_optimization(
         print(f"      Sampling candidates near detectable events...")
         X_candidates = sample_near_detectable(
             X_true_pool, y_true_pool, bounds, 
-            n_samples=1500, 
+            n_samples=candidate_samples,
             spread_factor=0.2, 
-            n_uniform=500,
+            n_uniform=candidate_uniform_samples,
             iteration=iteration,  # Pass iteration for adaptive sampling
             max_iterations=n_iterations
         )
@@ -342,26 +367,26 @@ def closed_loop_bayesian_optimization(
         candidate_X = X_candidates[best_idx]
         best_acq = -acq_values[best_idx]
 
-        # DEBUG: Check the top 5 candidates
-        print(f"\n      Top 5 candidates by acquisition value:")
-        top_indices = np.argsort(acq_values)[:5]
-        for i, idx in enumerate(top_indices):
-            acq_val = -acq_values[idx]
-            X_top = X_candidates[idx]
-            mean_g, std_g = float(direct_means[idx]), float(direct_stds[idx])
-            if diagnostic_gp_available:
-                _, uncertainty, best_filter = objective_with_uncertainty(
-                    X_top, gp_models, scaler_X, flat_limits, detection_calc, verbose=False
-                )
-            else:
-                uncertainty, best_filter = np.nan, "skipped"
-            print(f"        #{i+1}: acquisition={acq_val:.6f}, direct_GP_mean={mean_g:.4f}, "
-                  f"direct_GP_std={std_g:.4f}, best_filter={best_filter}, limit_sigma={uncertainty:.4f}")
-            print(f"             params: {dict(zip(feature_columns, X_top))}")
+        if debug_candidate_details:
+            print(f"\n      Top 5 candidates by acquisition value:")
+            top_indices = np.argsort(acq_values)[:5]
+            for i, idx in enumerate(top_indices):
+                acq_val = -acq_values[idx]
+                X_top = X_candidates[idx]
+                mean_g, std_g = float(direct_means[idx]), float(direct_stds[idx])
+                if diagnostic_gp_available:
+                    _, uncertainty, best_filter = objective_with_uncertainty(
+                        X_top, gp_models, scaler_X, flat_limits, detection_calc, verbose=False
+                    )
+                else:
+                    uncertainty, best_filter = np.nan, "skipped"
+                print(f"        #{i+1}: acquisition={acq_val:.6f}, direct_GP_mean={mean_g:.4f}, "
+                      f"direct_GP_std={std_g:.4f}, best_filter={best_filter}, limit_sigma={uncertainty:.4f}")
+                print(f"             params: {dict(zip(feature_columns, X_top))}")
 
         # Track direct-GP predicted probabilities for every scored candidate this iteration
-        candidate_probs = direct_means.tolist()
-        results['probs_all'].extend(candidate_probs)
+        if track_all_candidate_probs:
+            results['probs_all'].extend(direct_means.tolist())
 
         formatted_candidate = ", ".join(f"{name}={val:.1f}" for name, val in zip(feature_columns, candidate_X))
         print(f"\n      Proposed candidate: [{formatted_candidate}]")
@@ -372,14 +397,20 @@ def closed_loop_bayesian_optimization(
         )
         if diagnostic_gp_available:
             _, uncertainty, best_filter = objective_with_uncertainty(
-                candidate_X, gp_models, scaler_X, flat_limits, detection_calc, verbose=True
+                candidate_X,
+                gp_models,
+                scaler_X,
+                flat_limits,
+                detection_calc,
+                verbose=debug_candidate_details,
             )
         else:
             uncertainty, best_filter = np.nan, "skipped"
-        direct_expected_improvement(
-            candidate_X, direct_gp, direct_scaler_X, best_score_for_acq,
-            xi=xi, verbose=True
-        )
+        if debug_candidate_details:
+            direct_expected_improvement(
+                candidate_X, direct_gp, direct_scaler_X, best_score_for_acq,
+                xi=xi, verbose=True
+            )
         print(f"      Candidate direct-GP mean P_detect: {candidate_direct_mean:.4f}")
         print(f"      Candidate direct-GP std P_detect: {candidate_direct_std:.4f}")
         print(f"      Diagnostic gray-box best filter: {best_filter}")
@@ -586,7 +617,14 @@ def closed_loop_bayesian_optimization(
         print(f"\n  [4] Retraining direct scalar GP with new data...")
 
         t_gp_fit = time.time()
-        direct_gp = fit_direct_gp_with_scaler(X_true_pool, g_true_pool, direct_scaler_X)
+        direct_gp = fit_direct_gp_with_scaler(
+            X_true_pool,
+            g_true_pool,
+            direct_scaler_X,
+            n_restarts_optimizer=direct_gp_restarts,
+            max_fit_points=direct_gp_max_fit_points,
+            random_state=12345 + iteration,
+        )
         direct_gp_fit_seconds = time.time() - t_gp_fit
         iteration_seconds = time.time() - iteration_t0
         bo_overhead_seconds = (
@@ -600,8 +638,15 @@ def closed_loop_bayesian_optimization(
             'gp_refit_seconds': direct_gp_fit_seconds,
             'bo_overhead_seconds': bo_overhead_seconds,
             'iteration_seconds': iteration_seconds,
+            'candidate_samples': int(candidate_samples),
+            'candidate_uniform_samples': int(candidate_uniform_samples),
+            'direct_gp_restarts': int(direct_gp_restarts),
+            'direct_gp_max_fit_points': direct_gp_max_fit_points,
         })
         print(f"      Direct scalar GP retrained successfully")
+        if checkpoint_every and (iteration + 1) % checkpoint_every == 0:
+            _write_checkpoint()
+            print(f"      Checkpoint saved after iteration {iteration + 1}")
         print(
             "      Timing: "
             f"score={candidate_scoring_seconds:.1f}s, "

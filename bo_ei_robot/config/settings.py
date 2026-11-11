@@ -7,16 +7,34 @@ from datetime import datetime
 
 
 class Config:
-    """Configuration for NMMA simulation."""
+    """Portable configuration for the NMMA simulation and BO run."""
+
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # Development checkout containing the importable ``nmma`` source tree.
+    # This may be omitted when NMMA is installed in the active environment.
+    NMMA_WORKDIR = os.environ.get("NMMA_WORKDIR", PROJECT_ROOT)
     
     # Path to SVD models for kilonova lightcurve generation
-    SVD_PATH = os.environ.get("NMMA_SVD_PATH", "./svdmodels")
+    SVD_PATH = os.environ.get(
+        "SVD_PATH",
+        os.environ.get("NMMA_SVD_PATH", os.path.join(PROJECT_ROOT, "svdmodels")),
+    )
     
     # Prior file for NMMA
-    PRIOR_FILE = os.environ.get("NMMA_PRIOR_FILE", "./priors/Bu2019lm.prior")
+    PRIOR_FILE = os.environ.get(
+        "PRIOR_FILE",
+        os.environ.get(
+            "NMMA_PRIOR_FILE",
+            os.path.join(PROJECT_ROOT, "priors", "Bu2019lm.prior"),
+        ),
+    )
     
     # Output directory
-    OUTPUT_BASE = os.environ.get("BO_OUTPUT_BASE", "./out")
+    OUTPUT_BASE = os.environ.get(
+        "OUTPUT_BASE",
+        os.environ.get("BO_OUTPUT_BASE", os.path.join(PROJECT_ROOT, "out")),
+    )
     
     # ZTF Detection limits with errors
     ZTF_LIMITS = {

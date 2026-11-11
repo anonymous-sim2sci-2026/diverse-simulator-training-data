@@ -7,6 +7,7 @@ import json
 import os
 import time
 import warnings
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -23,11 +24,19 @@ from optimization.acquisition import (
     objective_with_uncertainty,
     expected_improvement_composite,
     expected_improvement_composite_batch,
+    sample_around_robot_center,
 )
-from optimization.objectives import objective_function_probability, objective_function_margin
+from optimization.objectives import (
+    objective_function_margin,
+    objective_function_probability,
+    objective_function_probability_batch,
+)
 from optimization.robot_h import (
     ROBOT_ACQUISITIONS,
     build_robot_state,
+    rebuild_ranked_robot_centers,
+    robot_ranked_region_mask,
+    robot_region_input_center,
     select_robot_candidate,
     update_robot_state,
 )
@@ -124,13 +133,24 @@ def closed_loop_bayesian_optimization(
     feature_columns: Optional[list] = None,
     detection_filters: Optional[list] = None,
     robot_distance_mode: str = "tail_l1",
-    robot_tau_quantile: float = 85.0,
+    robot_knn_k: int = 5,
+    robot_tau_quantile: float = 25.0,
+    robot_initial_length: float = 0.6,
     robot_rarity_n_bins: int = 20,
     eicf_mc_samples: int = 16,
-    candidate_samples: int = 300,
-    candidate_uniform_samples: int = 150,
+    candidate_samples: int = 1500,
+    candidate_uniform_samples: int = 600,
+    robot_region_candidates: int = 300,
+    trust_region_max_resamples: int = 20,
     scoring_progress_every: int = 25,
     eicf_batch_size: int = 128,
+    skip_detection_gp_refit: bool = False,
+    checkpoint_every: int = 1,
+    resume: bool = False,
+    checkpoint_file: Optional[str] = None,
+    max_runtime_hours: Optional[float] = None,
+    debug_candidate_details: bool = False,
+    track_all_candidate_probs: bool = False,
 ) -> Tuple:
     """
     CLOSED-LOOP BAYESIAN OPTIMIZATION
@@ -153,8 +173,10 @@ def closed_loop_bayesian_optimization(
 
     if acquisition != "ROBOT_EICF":
         raise ValueError("Only ROBOT_EICF is supported in this paper-facing folder.")
-    if robot_distance_mode != "tail_l1":
-        raise ValueError("Only tail_l1 is supported in this paper-facing folder.")
+    if robot_distance_mode not in {"tail_l1", "knn_l1"}:
+        raise ValueError("robot_distance_mode must be tail_l1 or knn_l1.")
+    if int(robot_knn_k) < 1:
+        raise ValueError("robot_knn_k must be at least 1.")
 
     if feature_columns is None:
         feature_columns = ['mass1', 'mass2', 'spin1z', 'spin2z', 'inclination', 'distance']
@@ -175,6 +197,9 @@ def closed_loop_bayesian_optimization(
         )
 
     os.makedirs(base_sim_output_dir, exist_ok=True)
+    if checkpoint_file is None:
+        checkpoint_file = os.path.join(base_sim_output_dir, "bo_state_checkpoint.joblib")
+    checkpoint_file = os.path.abspath(checkpoint_file)
 
     # Initialize training pool
     X_arr = X_train if isinstance(X_train, np.ndarray) else np.asarray(X_train)
@@ -182,24 +207,25 @@ def closed_loop_bayesian_optimization(
     y_true_pool = np.asarray(y_train_detection, dtype=float).copy()
     n_train = len(X_arr)
 
-    initial_probs = np.asarray([
-        objective_function_probability(
-            x, gp_models, scaler_X, flat_limits,
-            detection_calc=detection_calc
-        )
-        for x in X_arr
-    ], dtype=float)
+    initial_probs = objective_function_probability_batch(
+        X_arr, gp_models, scaler_X, flat_limits, detection_calc=detection_calc
+    )
+    observed_composite_scores = list(np.asarray(initial_probs, dtype=float))
 
     robot_state = None
     if acquisition in ROBOT_ACQUISITIONS:
         robot_state = build_robot_state(
             y_train_mags=y_train_mags,
             g_train=initial_probs,
+            X_train=X_arr,
             n_centers=min(10, max(1, n_iterations)),
             useful_threshold=0.5,
             tau_quantile=robot_tau_quantile,
             distance_mode=robot_distance_mode,
+            knn_k=robot_knn_k,
             rarity_n_bins=robot_rarity_n_bins,
+            distance_bounds=bounds[-1],
+            initial_trust_region_length=robot_initial_length,
         )
         if robot_state is None:
             print("  Warning: could not initialize ROBOT h-space state; using plain EI-CF selection.")
@@ -209,6 +235,8 @@ def closed_loop_bayesian_optimization(
             print(f"    centers: {len(robot_state['centers_z'])}")
             print(f"    h scaling: {robot_state.get('h_scaling', 'unknown')}")
             print(f"    distance mode: {robot_state.get('distance_mode', 'unknown')}")
+            if robot_distance_mode == "knn_l1":
+                print(f"    k nearest selected events: {robot_state['knn_k']}")
             print(f"    tau quantile: {robot_state.get('tau_quantile', robot_tau_quantile):.1f}")
             print(f"    diversity threshold tau: {robot_state['tau']:.4f}")
             print("    trust region: rectangular boxes in [0, 1] rank-scaled h-space")
@@ -233,14 +261,129 @@ def closed_loop_bayesian_optimization(
     new_events_records = []  # rows for new_events_df
 
     # Seed X_all/margin_all/source with the original training data
+    initial_margins = []
     for x in X_arr:
         margin = objective_function_margin(x, gp_models, scaler_X, flat_limits, detection_calc)
+        initial_margins.append(margin)
         results['X_all'].append(x)
         results['margin_all'].append(margin)
         results['source'].append('training')
+    running_best_margin = float(np.nanmax(initial_margins)) if initial_margins else -np.inf
+
+    start_iteration = 0
+    elapsed_seconds_before = 0.0
+    checkpoint_settings = {
+        "acquisition": acquisition,
+        "robot_distance_mode": robot_distance_mode,
+        "robot_tau_quantile": float(robot_tau_quantile),
+        "robot_initial_length": float(robot_initial_length),
+        "eicf_mc_samples": int(eicf_mc_samples),
+        "candidate_samples": int(candidate_samples),
+        "candidate_uniform_samples": int(candidate_uniform_samples),
+        "robot_region_candidates": int(robot_region_candidates),
+        "eicf_batch_size": int(eicf_batch_size),
+        "skip_detection_gp_refit": bool(skip_detection_gp_refit),
+        "feature_columns": list(feature_columns),
+    }
+    if robot_distance_mode == "knn_l1":
+        checkpoint_settings["robot_knn_k"] = int(robot_knn_k)
+
+    if resume:
+        if not os.path.exists(checkpoint_file):
+            raise FileNotFoundError(
+                f"Cannot resume because checkpoint does not exist: {checkpoint_file}"
+            )
+        print(f"  Loading restart checkpoint: {checkpoint_file}", flush=True)
+        state = joblib.load(checkpoint_file)
+        if state.get("checkpoint_version") != 2:
+            raise ValueError(
+                "This checkpoint predates ranked output-space ROBOT. Start a new "
+                "output folder so the changed algorithm is not mixed with the old run."
+            )
+        saved_settings = state.get("settings", {})
+        mismatches = {
+            key: (saved_settings.get(key), value)
+            for key, value in checkpoint_settings.items()
+            if saved_settings.get(key) != value
+        }
+        if mismatches:
+            details = ", ".join(
+                f"{key}: saved={old!r}, requested={new!r}"
+                for key, (old, new) in mismatches.items()
+            )
+            raise ValueError(
+                "Resume settings differ from the checkpoint. Use the same BO settings. "
+                + details
+            )
+
+        start_iteration = int(state["completed_iterations"])
+        if start_iteration > n_iterations:
+            raise ValueError(
+                f"Checkpoint already contains {start_iteration} iterations, which is "
+                f"greater than requested target {n_iterations}."
+            )
+        X_true_pool = state["X_true_pool"]
+        y_true_pool = state["y_true_pool"]
+        observed_composite_scores = state["observed_composite_scores"]
+        robot_state = state["robot_state"]
+        best_true_peak_mag = state["best_true_peak_mag"]
+        best_X = state["best_X"]
+        true_eval_log = state["true_eval_log"]
+        results = state["results"]
+        new_events_records = state["new_events_records"]
+        running_best_margin = state["running_best_margin"]
+        detection_gp = state.get("detection_gp", detection_gp)
+        elapsed_seconds_before = float(state.get("elapsed_seconds", 0.0))
+        np.random.set_state(state["numpy_random_state"])
+        print(
+            f"  Resuming at iteration {start_iteration + 1}; "
+            f"{start_iteration}/{n_iterations} iterations are complete.",
+            flush=True,
+        )
+
+    run_segment_t0 = time.time()
+
+    def _write_checkpoint(completed_iterations, force=False):
+        if not true_eval_log:
+            return
+        if not force and (checkpoint_every is None or checkpoint_every <= 0):
+            return
+        pd.DataFrame(true_eval_log).to_csv(
+            os.path.join(base_sim_output_dir, "closed_loop_results.csv"),
+            index=False,
+        )
+        if new_events_records:
+            pd.DataFrame(new_events_records).to_csv(
+                os.path.join(base_sim_output_dir, "new_events_with_h.csv"),
+                index=False,
+            )
+        state = {
+            "checkpoint_version": 2,
+            "completed_iterations": int(completed_iterations),
+            "target_iterations": int(n_iterations),
+            "settings": checkpoint_settings,
+            "X_true_pool": X_true_pool,
+            "y_true_pool": y_true_pool,
+            "observed_composite_scores": observed_composite_scores,
+            "robot_state": robot_state,
+            "best_true_peak_mag": best_true_peak_mag,
+            "best_X": best_X,
+            "true_eval_log": true_eval_log,
+            "results": results,
+            "new_events_records": new_events_records,
+            "running_best_margin": running_best_margin,
+            "detection_gp": detection_gp,
+            "numpy_random_state": np.random.get_state(),
+            "elapsed_seconds": elapsed_seconds_before + (time.time() - run_segment_t0),
+        }
+        checkpoint_dir = os.path.dirname(checkpoint_file)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        temporary_file = checkpoint_file + ".tmp"
+        joblib.dump(state, temporary_file)
+        os.replace(temporary_file, checkpoint_file)
 
     # MAIN LOOP: Iterate n_iterations times
-    for iteration in range(n_iterations):
+    for iteration in range(start_iteration, n_iterations):
         iteration_t0 = time.time()
 
         print(f"\n{'='*60}")
@@ -252,42 +395,97 @@ def closed_loop_bayesian_optimization(
         # ============================================================
         print(f"\n  [1] Proposing candidate from GP...")
 
-        print(f"      Computing best active-search utility from training pool...")
-        pool_probs = [
-            objective_function_probability(
-                x, gp_models, scaler_X, flat_limits,
-                detection_calc=detection_calc
-            )
-            for x in X_true_pool
-        ]
-        best_score_for_acq = float(np.max(pool_probs))
+        print(f"      Computing active-search utility from the composite h posterior...")
+        best_score_for_acq = float(np.nanmax(observed_composite_scores))
         best_prob = best_score_for_acq
         
         print(f"      Current best observed composite value f*=P_detect: {best_prob:.4f}")
-        print(f"      NOTE: Using EI-CF acquisition with 11D h(x); g(h) uses g/i/r peak magnitudes")
-        print("      NOTE: Applying ROBOT h-space trust/diversity filtering after EI-CF scoring")
+        print("      NOTE: Active-search score is E[g(h(x))], estimated from g/i/r posterior samples")
+        print("      NOTE: ROBOT applies dynamic h-space diversity and distance-bin balancing")
 
-        def acq_func(X_flat, _best_score=best_score_for_acq):
-            return -expected_improvement(
-                X_flat, gp_models, scaler_X, flat_limits,
-                _best_score, detection_gp, use_gp_detection=False, xi=xi,
-                n_mc=eicf_mc_samples,
-                detection_calc=detection_calc,
-                verbose=False
+        sampling_attempts = 0
+        selected_region_rank = None
+        robot_state = rebuild_ranked_robot_centers(robot_state)
+        trust_regions = robot_state.get("trust_regions", [])
+        first_rank = int(robot_state.get("next_region_rank", 0)) % len(trust_regions)
+        region_order = [
+            (first_rank + offset) % len(trust_regions)
+            for offset in range(len(trust_regions))
+        ]
+        for region_rank in region_order:
+            center_x = robot_region_input_center(robot_state, region_rank)
+            for region_attempt in range(1, trust_region_max_resamples + 1):
+                sampling_attempts += 1
+                print(
+                    f"      Sampling for ranked ROBOT region T_{region_rank + 1} "
+                    f"(attempt {region_attempt}/{trust_region_max_resamples})..."
+                )
+                X_candidates = sample_near_detectable(
+                    X_true_pool, y_true_pool, bounds,
+                    n_samples=candidate_samples,
+                    spread_factor=0.2,
+                    n_uniform=candidate_uniform_samples,
+                    iteration=iteration,
+                    max_iterations=n_iterations,
+                )
+                n_targeted = min(int(robot_region_candidates), len(X_candidates))
+                if center_x is not None and n_targeted > 0:
+                    X_candidates[:n_targeted] = sample_around_robot_center(
+                        center_x,
+                        bounds,
+                        n_samples=n_targeted,
+                        spread_factor=max(
+                            0.03,
+                            0.15 * float(trust_regions[region_rank].length),
+                        ),
+                    )
+                    np.random.shuffle(X_candidates)
+                    print(
+                        f"      Replaced {n_targeted} pool entries with inputs "
+                        f"targeted around the T_{region_rank + 1} incumbent."
+                    )
+                feasible_mask = robot_ranked_region_mask(
+                    X_candidates,
+                    gp_models,
+                    scaler_X,
+                    robot_state,
+                    region_rank,
+                )
+                n_inside = int(np.sum(feasible_mask))
+                print(
+                    f"      Candidates feasible for T_{region_rank + 1}: "
+                    f"{n_inside}/{len(X_candidates)}"
+                )
+                if n_inside:
+                    selected_region_rank = int(region_rank)
+                    break
+            if selected_region_rank is not None:
+                break
+
+            # Output-space boxes cannot be sampled directly. If repeated input
+            # pools miss one, expand that region and let the next rank try.
+            region = trust_regions[region_rank]
+            old_length = float(region.length)
+            region.length = min(2.0 * region.length, region.length_max)
+            region.failure_counter = 0
+            print(
+                f"      Skipping empty T_{region_rank + 1}; expanded length "
+                f"from {old_length:.4f} to {region.length:.4f}."
             )
 
-        print(f"      Sampling candidates near detectable events...")
-        X_candidates = sample_near_detectable(
-            X_true_pool, y_true_pool, bounds, 
-            n_samples=candidate_samples, 
-            spread_factor=0.2, 
-            n_uniform=candidate_uniform_samples,
-            iteration=iteration,  # Pass iteration for adaptive sampling
-            max_iterations=n_iterations
-        )
+        if selected_region_rank is None:
+            for region in trust_regions:
+                region.length = float(robot_state["initial_trust_region_length"])
+                region.success_counter = 0
+                region.failure_counter = 0
+            raise RuntimeError(
+                "All ranked ROBOT output-space regions were empty after targeted "
+                "sampling. Their lengths were reset in memory; rerun with more "
+                "--robot-region-candidates or a larger initial length."
+            )
 
-        print(f"      Scoring {len(X_candidates)} candidates with {acquisition} acquisition "
-              f"(EI-CF n_mc={eicf_mc_samples}, batch_size={eicf_batch_size})...", flush=True)
+        print(f"      Scoring {len(X_candidates)} candidates with {acquisition} active search "
+              f"(n_mc={eicf_mc_samples}, batch_size={eicf_batch_size})...", flush=True)
         t_score = time.time()
         eicf_scores = expected_improvement_composite_batch(
             X_candidates,
@@ -300,6 +498,7 @@ def closed_loop_bayesian_optimization(
             xi=xi,
             batch_size=eicf_batch_size,
             progress_every=max(1, scoring_progress_every // max(eicf_batch_size, 1)),
+            active_search=True,
         )
         acq_values = -np.asarray(eicf_scores, dtype=float)
         candidate_scoring_seconds = time.time() - t_score
@@ -316,21 +515,36 @@ def closed_loop_bayesian_optimization(
                 gp_models=gp_models,
                 scaler_X=scaler_X,
                 robot_state=robot_state,
+                region_index=selected_region_rank,
             )
             robot_selection_seconds = time.time() - t_robot
             print(f"      ROBOT filtering finished in {robot_selection_seconds:.1f} s")
             if robot_diagnostics.get("robot_used"):
                 print(f"      ROBOT feasible candidates: {robot_diagnostics['feasible_candidates']}/{len(X_candidates)}")
                 print(f"      ROBOT candidates inside h trust regions: {robot_diagnostics['trust_region_candidates']}/{len(X_candidates)}")
-                print(f"      ROBOT tau used: {robot_diagnostics['robot_tau_used']:.4f} "
-                      f"(base tau={robot_diagnostics['robot_tau']:.4f})")
+                print(
+                    f"      ROBOT fixed tau used: "
+                    f"{robot_diagnostics['robot_tau_used']:.4f}"
+                )
+                print(
+                    f"      ROBOT selected ranked region: "
+                    f"T_{int(robot_diagnostics['robot_region_rank']) + 1}"
+                )
                 if not robot_diagnostics.get("robot_tau_satisfied", True):
                     print(
-                        "      ROBOT fixed tau not satisfied; "
+                        "      ROBOT fixed diversity constraint unavailable; "
                         f"best available diversity={robot_diagnostics.get('robot_best_available_diversity')}, "
                         f"shortfall={robot_diagnostics.get('robot_tau_shortfall')}"
                     )
                 print(f"      ROBOT distance mode: {robot_diagnostics.get('robot_distance_mode', 'unknown')}")
+                if robot_diagnostics.get("robot_distance_bin") is not None:
+                    print(
+                        "      ROBOT selected distance bin: "
+                        f"[{robot_diagnostics['robot_distance_bin_lower']:.1f}, "
+                        f"{robot_diagnostics['robot_distance_bin_upper']:.1f}] Mpc "
+                        f"(detectable count before selection="
+                        f"{robot_diagnostics['robot_distance_bin_count_before']})"
+                    )
                 print(f"      ROBOT selected trust-region length: {robot_diagnostics['robot_length']:.4f} "
                       f"(min={robot_diagnostics['robot_length_min']:.6f}, "
                       f"max={robot_diagnostics['robot_length_max']:.4f})")
@@ -349,29 +563,25 @@ def closed_loop_bayesian_optimization(
         candidate_X = X_candidates[best_idx]
         best_acq = -acq_values[best_idx]
 
-        # DEBUG: Check the top 5 candidates
-        print(f"\n      Top 5 candidates by acquisition value:")
-        top_indices = np.argsort(acq_values)[:5]
-        for i, idx in enumerate(top_indices):
-            acq_val = -acq_values[idx]
-            X_top = X_candidates[idx]
-            # Get score and uncertainty for this candidate
-            score, uncertainty, best_filter = objective_with_uncertainty(
-                X_top, gp_models, scaler_X, flat_limits, detection_calc, verbose=False
-            )
-            print(f"        #{i+1}: {acquisition}={acq_val:.6f}, mean P_detect={score:.4f}, "
-                  f"limit_sigma={uncertainty:.4f}, filter={best_filter}")
-            print(f"             params: {dict(zip(feature_columns, X_top))}")
+        if debug_candidate_details:
+            print(f"\n      Top 5 candidates by acquisition value:")
+            top_indices = np.argsort(acq_values)[:5]
+            for i, idx in enumerate(top_indices):
+                acq_val = -acq_values[idx]
+                X_top = X_candidates[idx]
+                score, uncertainty, best_filter = objective_with_uncertainty(
+                    X_top, gp_models, scaler_X, flat_limits, detection_calc, verbose=False
+                )
+                print(f"        #{i+1}: {acquisition}={acq_val:.6f}, mean P_detect={score:.4f}, "
+                      f"limit_sigma={uncertainty:.4f}, filter={best_filter}")
+                print(f"             params: {dict(zip(feature_columns, X_top))}")
 
         # Track CDF probability + margin for every scored candidate this iteration
-        candidate_probs = [
-            objective_function_probability(
-                x, gp_models, scaler_X, flat_limits,
-                detection_calc=detection_calc
+        if track_all_candidate_probs:
+            candidate_probs = objective_function_probability_batch(
+                X_candidates, gp_models, scaler_X, flat_limits, detection_calc=detection_calc
             )
-            for x in X_candidates
-        ]
-        results['probs_all'].extend(candidate_probs)
+            results['probs_all'].extend(candidate_probs)
 
         formatted_candidate = ", ".join(f"{name}={val:.1f}" for name, val in zip(feature_columns, candidate_X))
         print(f"\n      Proposed candidate: [{formatted_candidate}]")
@@ -379,13 +589,19 @@ def closed_loop_bayesian_optimization(
         
         # DEBUG: Check the proposed candidate's active-search probability
         score, uncertainty, best_filter = objective_with_uncertainty(
-            candidate_X, gp_models, scaler_X, flat_limits, detection_calc, verbose=True
+            candidate_X,
+            gp_models,
+            scaler_X,
+            flat_limits,
+            detection_calc,
+            verbose=debug_candidate_details,
         )
-        expected_improvement_composite(
-            candidate_X, gp_models, scaler_X, flat_limits, best_score_for_acq,
-            detection_calc=detection_calc, n_mc=eicf_mc_samples,
-            xi=xi, verbose=True
-        )
+        if debug_candidate_details:
+            expected_improvement_composite(
+                candidate_X, gp_models, scaler_X, flat_limits, best_score_for_acq,
+                detection_calc=detection_calc, n_mc=eicf_mc_samples,
+                xi=xi, verbose=True
+            )
         print(f"      Candidate active-search P_detect: {score:.4f} (from {best_filter})")
         print(f"      Candidate limit uncertainty: {uncertainty:.4f}")
 
@@ -436,6 +652,7 @@ def closed_loop_bayesian_optimization(
             'true_peak_mag': peak_mag,
             'acquisition_value': best_acq,
             'candidate_count': int(len(X_candidates)),
+            'candidate_sampling_attempts': int(sampling_attempts),
             'candidate_scoring_seconds': candidate_scoring_seconds,
             'robot_selection_seconds': robot_selection_seconds,
             'simulation_seconds': simulation_seconds,
@@ -447,6 +664,8 @@ def closed_loop_bayesian_optimization(
             'robot_tau_quantile': robot_diagnostics.get('robot_tau_quantile'),
             'robot_tau': robot_diagnostics.get('robot_tau'),
             'robot_tau_used': robot_diagnostics.get('robot_tau_used'),
+            'robot_dynamic_tau_percentile': robot_diagnostics.get('robot_dynamic_tau_percentile'),
+            'robot_tail_fraction': robot_diagnostics.get('robot_tail_fraction'),
             'robot_tau_satisfied': robot_diagnostics.get('robot_tau_satisfied'),
             'robot_tau_fallback_reason': robot_diagnostics.get('robot_tau_fallback_reason'),
             'robot_best_available_diversity': robot_diagnostics.get('robot_best_available_diversity'),
@@ -456,12 +675,28 @@ def closed_loop_bayesian_optimization(
             'robot_length_max': robot_diagnostics.get('robot_length_max'),
             'robot_center_distance': robot_diagnostics.get('robot_center_distance'),
             'robot_selected_distance': robot_diagnostics.get('robot_selected_distance'),
+            'robot_nearest_selected_index': robot_diagnostics.get('robot_nearest_selected_index'),
+            'robot_neighbor_selected_indices': robot_diagnostics.get('robot_neighbor_selected_indices'),
+            'robot_effective_neighbor_count': robot_diagnostics.get('robot_effective_neighbor_count'),
+            'robot_knn_k': robot_diagnostics.get('robot_knn_k'),
+            'robot_l1_contribution_sum': robot_diagnostics.get('robot_l1_contribution_sum'),
+            'robot_selection_margin': robot_diagnostics.get('robot_selection_margin'),
             'robot_center_index': robot_diagnostics.get('robot_center_index'),
+            'robot_region_rank': robot_diagnostics.get('robot_region_rank'),
             'robot_diversity_weight': robot_diagnostics.get('robot_diversity_weight'),
             'robot_blended_score': robot_diagnostics.get('robot_blended_score'),
             'robot_acquisition_score_norm': robot_diagnostics.get('robot_acquisition_score_norm'),
             'robot_diversity_score_norm': robot_diagnostics.get('robot_diversity_score_norm'),
+            'robot_distance_balancing_used': robot_diagnostics.get('robot_distance_balancing_used'),
+            'robot_distance_bin': robot_diagnostics.get('robot_distance_bin'),
+            'robot_distance_bin_count_before': robot_diagnostics.get('robot_distance_bin_count_before'),
+            'robot_distance_bin_lower': robot_diagnostics.get('robot_distance_bin_lower'),
+            'robot_distance_bin_upper': robot_diagnostics.get('robot_distance_bin_upper'),
         })
+        for h_col, contribution in robot_diagnostics.get(
+            'robot_l1_contributions', {}
+        ).items():
+            true_eval_log[-1][f'robot_l1_contribution_{h_col}'] = contribution
         for filt in detection_filters:
             if filt in true_peak_mags_by_filter:
                 true_eval_log[-1][f'true_peak_mag_{filt}'] = true_peak_mags_by_filter[filt]
@@ -469,7 +704,7 @@ def closed_loop_bayesian_optimization(
         # Track this candidate for new_events_df (plot_optimization_results)
         candidate_prob = objective_function_probability(
             candidate_X, gp_models, scaler_X, flat_limits,
-            detection_calc=detection_calc
+            detection_gp=None, use_gp_detection=False, detection_calc=detection_calc
         )
         candidate_mags, _ = None, None
         try:
@@ -483,10 +718,13 @@ def closed_loop_bayesian_optimization(
         event_record['detected'] = int(rollout_label)
         event_record['nmma_threshold_detected'] = int(detectable)
         event_record['robot_used'] = bool(robot_diagnostics.get('robot_used', False))
+        event_record['candidate_sampling_attempts'] = int(sampling_attempts)
         event_record['robot_distance_mode'] = robot_diagnostics.get('robot_distance_mode')
         event_record['robot_tau_quantile'] = robot_diagnostics.get('robot_tau_quantile')
         event_record['robot_tau'] = robot_diagnostics.get('robot_tau')
         event_record['robot_tau_used'] = robot_diagnostics.get('robot_tau_used')
+        event_record['robot_dynamic_tau_percentile'] = robot_diagnostics.get('robot_dynamic_tau_percentile')
+        event_record['robot_tail_fraction'] = robot_diagnostics.get('robot_tail_fraction')
         event_record['robot_tau_satisfied'] = robot_diagnostics.get('robot_tau_satisfied')
         event_record['robot_tau_fallback_reason'] = robot_diagnostics.get('robot_tau_fallback_reason')
         event_record['robot_best_available_diversity'] = robot_diagnostics.get('robot_best_available_diversity')
@@ -496,11 +734,27 @@ def closed_loop_bayesian_optimization(
         event_record['robot_length_max'] = robot_diagnostics.get('robot_length_max')
         event_record['robot_center_distance'] = robot_diagnostics.get('robot_center_distance')
         event_record['robot_selected_distance'] = robot_diagnostics.get('robot_selected_distance')
+        event_record['robot_nearest_selected_index'] = robot_diagnostics.get('robot_nearest_selected_index')
+        event_record['robot_neighbor_selected_indices'] = robot_diagnostics.get('robot_neighbor_selected_indices')
+        event_record['robot_effective_neighbor_count'] = robot_diagnostics.get('robot_effective_neighbor_count')
+        event_record['robot_knn_k'] = robot_diagnostics.get('robot_knn_k')
+        event_record['robot_l1_contribution_sum'] = robot_diagnostics.get('robot_l1_contribution_sum')
+        event_record['robot_selection_margin'] = robot_diagnostics.get('robot_selection_margin')
         event_record['robot_center_index'] = robot_diagnostics.get('robot_center_index')
+        event_record['robot_region_rank'] = robot_diagnostics.get('robot_region_rank')
         event_record['robot_diversity_weight'] = robot_diagnostics.get('robot_diversity_weight')
         event_record['robot_blended_score'] = robot_diagnostics.get('robot_blended_score')
         event_record['robot_acquisition_score_norm'] = robot_diagnostics.get('robot_acquisition_score_norm')
         event_record['robot_diversity_score_norm'] = robot_diagnostics.get('robot_diversity_score_norm')
+        event_record['robot_distance_balancing_used'] = robot_diagnostics.get('robot_distance_balancing_used')
+        event_record['robot_distance_bin'] = robot_diagnostics.get('robot_distance_bin')
+        event_record['robot_distance_bin_count_before'] = robot_diagnostics.get('robot_distance_bin_count_before')
+        event_record['robot_distance_bin_lower'] = robot_diagnostics.get('robot_distance_bin_lower')
+        event_record['robot_distance_bin_upper'] = robot_diagnostics.get('robot_distance_bin_upper')
+        for h_col, contribution in robot_diagnostics.get(
+            'robot_l1_contributions', {}
+        ).items():
+            event_record[f'robot_l1_contribution_{h_col}'] = contribution
         event_record['log10_mej_dyn'] = float(injection_ejecta.get('log10_mej_dyn', kilonova_params['log10_mej_dyn']))
         event_record['log10_mej_wind'] = float(injection_ejecta.get('log10_mej_wind', kilonova_params['log10_mej_wind']))
         event_record['ejecta_source'] = 'injection.json' if injection_ejecta else 'map_gw_to_kilonova'
@@ -542,6 +796,7 @@ def closed_loop_bayesian_optimization(
         candidate_margin = objective_function_margin(
             candidate_X, gp_models, scaler_X, flat_limits, detection_calc
         )
+        running_best_margin = max(running_best_margin, float(candidate_margin))
         results['X_all'].append(candidate_X)
         results['margin_all'].append(candidate_margin)
         results['source'].append('bo_candidate')
@@ -555,11 +810,7 @@ def closed_loop_bayesian_optimization(
 
         # Track running-best margin/probability history for this iteration
         results['probs_history'].append(best_prob)
-        current_margin_pool = [
-            objective_function_margin(x, gp_models, scaler_X, flat_limits, detection_calc)
-            for x in X_true_pool
-        ]
-        results['score_history'].append(float(np.max(current_margin_pool)))
+        results['score_history'].append(running_best_margin)
 
         # ============================================================
         # STEP 3: ADD NEW DATA TO TRAINING POOL
@@ -568,9 +819,22 @@ def closed_loop_bayesian_optimization(
 
         X_true_pool = np.vstack([X_true_pool, candidate_X])
         y_true_pool = np.append(y_true_pool, float(rollout_label))
+        observed_composite_scores.append(float(true_detection_prob))
 
         if acquisition in ROBOT_ACQUISITIONS and robot_state is not None:
-            robot_state = update_robot_state(robot_state, true_detection_prob)
+            observed_h = [
+                event_record.get(
+                    column,
+                    robot_diagnostics.get("predicted_h", {}).get(column, np.nan),
+                )
+                for column in robot_state["h_columns"]
+            ]
+            robot_state = update_robot_state(
+                robot_state,
+                true_detection_prob,
+                x_next=candidate_X,
+                h_next=observed_h,
+            )
             selected_center_index = robot_diagnostics.get('robot_center_index')
             if selected_center_index is not None:
                 tr_state = robot_state["trust_regions"][int(selected_center_index)]
@@ -580,6 +844,36 @@ def closed_loop_bayesian_optimization(
                 print(f"        success_counter: {tr_state.success_counter}")
                 print(f"        failure_counter: {tr_state.failure_counter}")
                 print(f"        restart_triggered: {tr_state.restart_triggered}")
+                restart_info = robot_state.get("last_restart")
+                if restart_info is not None:
+                    print(
+                        "        trust-region restart: "
+                        f"length {restart_info['previous_length']:.6f} -> "
+                        f"{restart_info['new_length']:.4f}, "
+                        f"new selected-point center={restart_info['selected_point_index']}"
+                    )
+                    event_record["robot_restart_performed"] = True
+                    event_record["robot_restart_previous_length"] = restart_info[
+                        "previous_length"
+                    ]
+                    true_eval_log[-1].update(event_record)
+                else:
+                    event_record["robot_restart_performed"] = False
+                    true_eval_log[-1]["robot_restart_performed"] = False
+
+            robot_records = [
+                row for row in true_eval_log
+                if row.get("robot_tau_satisfied") is not None
+            ]
+            satisfied_count = sum(
+                bool(row.get("robot_tau_satisfied")) for row in robot_records
+            )
+            satisfaction_rate = satisfied_count / max(len(robot_records), 1)
+            print(
+                "      ROBOT cumulative tau satisfaction: "
+                f"{satisfied_count}/{len(robot_records)} "
+                f"({satisfaction_rate:.1%})"
+            )
 
         print(f"      Training pool size: {len(X_true_pool)} events")
         print(f"      Detectable in pool: {np.sum(y_true_pool)}/{len(y_true_pool)}")
@@ -587,26 +881,30 @@ def closed_loop_bayesian_optimization(
         # ============================================================
         # STEP 4: RETRAIN DETECTION GP WITH NEW DATA
         # ============================================================
-        print(f"\n  [4] Retraining detection GP with new data...")
-
-        # Keep using the scaler that was fitted with the magnitude GPs.
-        # Refitting it here would make later magnitude-GP predictions use a
-        # different feature transform than the one those GPs were trained on.
-        X_scaled_detection = scaler_X.transform(X_true_pool)
-
-        detection_gp = GaussianProcessRegressor(
-            kernel=(
-                ConstantKernel(1.0, (1e-4, 1e4))
-                * Matern(length_scale=1.0, length_scale_bounds=(1e-3, 1e4), nu=2.5)
-                + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-6, 1e1))
-            ),
-            n_restarts_optimizer=1,
-            alpha=1e-6,
-        )
         t_gp_fit = time.time()
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=ConvergenceWarning)
-            detection_gp.fit(X_scaled_detection, y_true_pool)
+        if skip_detection_gp_refit:
+            print(f"\n  [4] Skipping scalar detection-GP refit (--skip-detection-gp-refit)...")
+            detection_gp_fit_seconds = 0.0
+        else:
+            print(f"\n  [4] Retraining detection GP with new data...")
+
+            # Keep using the scaler that was fitted with the magnitude GPs.
+            # Refitting it here would make later magnitude-GP predictions use a
+            # different feature transform than the one those GPs were trained on.
+            X_scaled_detection = scaler_X.transform(X_true_pool)
+
+            detection_gp = GaussianProcessRegressor(
+                kernel=(
+                    ConstantKernel(1.0, (1e-4, 1e4))
+                    * Matern(length_scale=1.0, length_scale_bounds=(1e-3, 1e4), nu=2.5)
+                    + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-6, 1e1))
+                ),
+                n_restarts_optimizer=1,
+                alpha=1e-6,
+            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=ConvergenceWarning)
+                detection_gp.fit(X_scaled_detection, y_true_pool)
         detection_gp_fit_seconds = time.time() - t_gp_fit
         iteration_seconds = time.time() - iteration_t0
         bo_overhead_seconds = (
@@ -622,7 +920,14 @@ def closed_loop_bayesian_optimization(
             'iteration_seconds': iteration_seconds,
         })
 
-        print(f"      Detection GP retrained successfully")
+        if not skip_detection_gp_refit:
+            print(f"      Detection GP retrained successfully")
+        if checkpoint_every and (iteration + 1) % checkpoint_every == 0:
+            _write_checkpoint(iteration + 1)
+            print(
+                f"      Restart checkpoint saved after iteration {iteration + 1}: "
+                f"{checkpoint_file}"
+            )
         print(
             "      Timing: "
             f"score={candidate_scoring_seconds:.1f}s, "
@@ -640,6 +945,23 @@ def closed_loop_bayesian_optimization(
         print(f"      Best peak mag so far: {best_true_peak_mag:.3f}" if best_true_peak_mag != np.inf else "      Best peak mag so far: None")
         if best_X is not None:
             print(f"      Best parameters so far: {dict(zip(feature_columns, best_X))}")
+
+        if max_runtime_hours is not None:
+            segment_hours = (time.time() - run_segment_t0) / 3600.0
+            if segment_hours >= max_runtime_hours:
+                _write_checkpoint(iteration + 1, force=True)
+                print(
+                    f"\nReached the per-job runtime limit of {max_runtime_hours:.2f} hours. "
+                    f"Stopped cleanly after iteration {iteration + 1}."
+                )
+                print(f"Resume from: {checkpoint_file}")
+                break
+
+    completed_iterations = len(true_eval_log)
+    _write_checkpoint(completed_iterations, force=True)
+    results["cumulative_runtime_seconds"] = (
+        elapsed_seconds_before + (time.time() - run_segment_t0)
+    )
 
     # ============================================================
     # FINAL RESULTS

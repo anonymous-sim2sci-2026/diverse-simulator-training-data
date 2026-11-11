@@ -1,0 +1,2 @@
+method,n_iterations,new_detected,final_h_kl_sum,initial_h_kl_sum,delta_h_kl_sum,h_columns
+BO,80,80,3.132689653650016,3.875806721443687,0.7431170677936709,"snr,area90,log10_mej_dyn,log10_mej_wind,g,r,i,distance"

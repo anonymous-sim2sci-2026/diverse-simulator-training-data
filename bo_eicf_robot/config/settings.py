@@ -7,16 +7,34 @@ from datetime import datetime
 
 
 class Config:
-    """Configuration for NMMA simulation."""
+    """Portable configuration for the NMMA simulation and BO run."""
+
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    NMMA_WORKDIR = os.environ.get("NMMA_WORKDIR", PROJECT_ROOT)
     
     # Path to SVD models for kilonova lightcurve generation
-    SVD_PATH = os.environ.get("NMMA_SVD_PATH", "./svdmodels")
+    SVD_PATH = os.environ.get(
+        "SVD_PATH",
+        os.environ.get("NMMA_SVD_PATH", os.path.join(PROJECT_ROOT, "svdmodels")),
+    )
     
     # Prior file for NMMA
-    PRIOR_FILE = os.environ.get("NMMA_PRIOR_FILE", "./priors/Bu2019lm.prior")
+    PRIOR_FILE = os.environ.get(
+        "PRIOR_FILE",
+        os.environ.get(
+            "NMMA_PRIOR_FILE",
+            os.path.join(PROJECT_ROOT, "priors", "Bu2019lm.prior"),
+        ),
+    )
     
     # Output directory
-    OUTPUT_BASE = os.environ.get("BO_OUTPUT_BASE", "./out")
+    OUTPUT_BASE = os.environ.get(
+        "OUTPUT_BASE",
+        os.environ.get("BO_OUTPUT_BASE", os.path.join(PROJECT_ROOT, "out")),
+    )
+
+    NMMA_FILTER_TIMEOUT_SECONDS = 300
+    NMMA_INJECTION_TIMEOUT_SECONDS = 120
     
     # ZTF Detection limits with errors
     ZTF_LIMITS = {
@@ -45,7 +63,7 @@ class Config:
         'spin1z': (0.0, 0.95),
         'spin2z': (0.0, 0.4), 
         'inclination': (0.0, 3.141592653589793),  # np.pi
-        'distance': (55.0, 1500.0),
+        'distance': (55.0, 722.0),
     }
     
     # Detection filters used by the optimizer and detection scoring.
