@@ -11,6 +11,23 @@ Each folder is self-contained and includes its initial O5a/O5b/O5c training
 tables, command-line entry points, requirements, and method-specific README.
 Generated NMMA products, GP caches, and checkpoints are intentionally omitted.
 
+## Prerequisites
+
+Before running these scripts, install the NMMA codebase and create/activate an
+NMMA-compatible Python environment. The closed-loop simulations call NMMA's
+`lightcurve-analysis` machinery and require access to the NMMA repository,
+SVD model directory, and prior file.
+
+For example:
+
+```bash
+git clone https://github.com/nuclear-multimessenger-astronomy/nmma.git
+cd nmma
+conda env create -f environment.yml
+conda activate nmma_env
+pip install -e .
+```
+
 ## External dependencies
 
 Install NMMA and set the external model paths before running a method:
